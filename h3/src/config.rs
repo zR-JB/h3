@@ -51,11 +51,13 @@ impl From<&frame::Settings> for Settings {
                 .get(frame::SettingId::MAX_HEADER_LIST_SIZE)
                 .unwrap_or(defaults.max_field_section_size),
             enable_webtransport: settings
-                .get(frame::SettingId::ENABLE_WEBTRANSPORT)
+                .get(frame::SettingId::WT_ENABLED)
+                .or_else(|| settings.get(frame::SettingId::ENABLE_WEBTRANSPORT))
                 .map(|value| value != 0)
                 .unwrap_or(defaults.enable_webtransport),
             max_webtransport_sessions: settings
-                .get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS)
+                .get(frame::SettingId::WT_MAX_SESSIONS)
+                .or_else(|| settings.get(frame::SettingId::WEBTRANSPORT_MAX_SESSIONS))
                 .unwrap_or(defaults.max_webtransport_sessions),
             enable_datagram: settings
                 .get(frame::SettingId::H3_DATAGRAM)
@@ -130,6 +132,8 @@ impl TryFrom<Config> for frame::Settings {
             max_webtransport_sessions,
         )?;
 
+        settings.insert(frame::SettingId::WT_ENABLED, enable_webtransport as u64)?;
+        settings.insert(frame::SettingId::WT_MAX_SESSIONS, max_webtransport_sessions)?;
         Ok(settings)
     }
 }
@@ -147,6 +151,11 @@ impl Default for Settings {
 }
 
 impl Settings {
+    /// Maximum WebTransport sessions permitted by the peer.
+    pub fn max_webtransport_sessions(&self) -> u64 {
+        self.max_webtransport_sessions
+    }
+
     /// https://datatracker.ietf.org/doc/html/draft-ietf-webtrans-http3/#section-3.1
     /// Sets `SETTINGS_ENABLE_WEBTRANSPORT` if enabled
     pub fn enable_webtransport(&self) -> bool {

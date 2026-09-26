@@ -404,6 +404,8 @@ impl SettingId {
                 | SettingId::QPACK_MAX_TABLE_CAPACITY
                 | SettingId::QPACK_MAX_BLOCKED_STREAMS
                 | SettingId::ENABLE_CONNECT_PROTOCOL
+                | SettingId::WT_ENABLED
+                | SettingId::WT_MAX_SESSIONS
                 | SettingId::ENABLE_WEBTRANSPORT
                 | SettingId::WEBTRANSPORT_MAX_SESSIONS
                 | SettingId::H3_DATAGRAM,
@@ -455,9 +457,11 @@ setting_identifiers! {
     H3_SETTING_ENABLE_DATAGRAM_CHROME_SPECIFIC= 0xFFD277,
 
     WEBTRANSPORT_MAX_SESSIONS = 0x2b603743,
+    WT_ENABLED = 0x2c7cf000,
+    WT_MAX_SESSIONS = 0x14e9cd29,
 }
 
-const SETTINGS_LEN: usize = 8;
+const SETTINGS_LEN: usize = 10;
 
 #[derive(Debug, PartialEq)]
 pub struct Settings {
@@ -670,6 +674,8 @@ mod tests {
                     (SettingId::NONE, 0),
                     (SettingId::NONE, 0),
                     (SettingId::NONE, 0),
+                    (SettingId::NONE, 0),
+                    (SettingId::NONE, 0),
                 ],
                 len: 4,
             }),
@@ -683,6 +689,8 @@ mod tests {
                     (SettingId::QPACK_MAX_BLOCKED_STREAMS, 0xfad3),
                     // check without the Grease setting because this is ignored
                     (SettingId(0), 0),
+                    (SettingId::NONE, 0),
+                    (SettingId::NONE, 0),
                     (SettingId::NONE, 0),
                     (SettingId::NONE, 0),
                     (SettingId::NONE, 0),
