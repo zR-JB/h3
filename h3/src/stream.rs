@@ -268,7 +268,6 @@ pub(super) struct AcceptRecvStream<S, B> {
     ty: Option<StreamType>,
     /// push_id or session_id
     id: Option<VarInt>,
-    expected: Option<usize>,
 }
 
 impl<S, B> AcceptRecvStream<S, B>
@@ -285,7 +284,6 @@ where
             stream: BufRecvStream::new(stream),
             ty: None,
             id: None,
-            expected: None,
         }
     }
 
@@ -312,6 +310,16 @@ where
         let mut stream_stopped = None;
 
         loop {
+            let mut buf = self.stream.buf_mut();
+            if buf.has_remaining() && buf.remaining() >= VarInt::encoded_size(buf.chunk()[0]) {
+                let value = VarInt::decode(&mut buf).map_err(|_| {
+                    PollTypeError::InternalError(InternalConnectionError::new(
+                        Code::H3_INTERNAL_ERROR,
+                        "Unexpected end parsing varint".to_string(),
+                    ))
+                })?;
+                return Poll::Ready(Ok((value, stream_stopped)));
+            }
             if stream_stopped.is_some() {
                 return Poll::Ready(Err(PollTypeError::EndOfStream));
             }
@@ -335,37 +343,12 @@ where
                     Some(StreamEnd::Other)
                 }
             };
-
-            let mut buf = self.stream.buf_mut();
-            if self.expected.is_none() && buf.remaining() >= 1 {
-                self.expected = Some(VarInt::encoded_size(buf.chunk()[0]));
-            }
-
-            if let Some(expected) = self.expected {
-                if buf.remaining() < expected {
-                    continue;
-                }
-            } else {
-                continue;
-            }
-
-            let reult = VarInt::decode(&mut buf).map_err(|_| {
-                PollTypeError::InternalError(InternalConnectionError::new(
-                    Code::H3_INTERNAL_ERROR,
-                    "Unexpected end parsing varint".to_string(),
-                ))
-            })?;
-
-            return Poll::Ready(Ok((reult, stream_stopped)));
         }
     }
 
     pub fn poll_type(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), PollTypeError>> {
         // If we haven't parsed the stream type yet
         if self.ty.is_none() {
-            // TODO create a test for the StreamEnd Option
-            // If the stream ended or reset directly after the type was received
-            // can we poll data again?
             let (var, _) = ready!(self.poll_next_varint(cx))?;
             let ty = StreamType::from_value(var.0);
             self.ty = Some(ty);
@@ -721,6 +704,86 @@ mod tests {
     use crate::proto::coding::BufExt;
 
     use super::*;
+
+    #[tokio::test]
+    async fn accept_buffered_and_fragmented_webtransport_headers() {
+        use crate::{quic::Connection as _, tests::Pair};
+        use futures_util::FutureExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut pair = Pair::default();
+            let mut server = pair.server();
+            let (client, mut receiver) = tokio::join!(pair.client_inner(), server.next());
+            for id in [0, 64, 16384, 1073741824] {
+                for fragmented in [false, true] {
+                    for (payload, reset_before_parse) in [
+                        (b"".as_slice(), false),
+                        (b"progress".as_slice(), false),
+                        (b"".as_slice(), true),
+                    ] {
+                        let mut header = Vec::new();
+                        StreamType::WEBTRANSPORT_UNI.encode(&mut header);
+                        VarInt::from_u64(id).unwrap().encode(&mut header);
+                        let mut sender = client.open_uni().await.unwrap();
+                        let chunks: Vec<_> = if fragmented {
+                            header.chunks(1).collect()
+                        } else {
+                            vec![header.as_slice()]
+                        };
+                        sender.write_all(chunks[0]).await.unwrap();
+                        let stream = future::poll_fn(|cx| receiver.poll_accept_recv(cx))
+                            .await
+                            .unwrap();
+                        let mut accepted = AcceptRecvStream::<_, Bytes>::new(stream);
+                        for (index, chunk) in chunks.iter().enumerate() {
+                            if index != 0 {
+                                sender.write_all(chunk).await.unwrap();
+                            }
+                            if index + 1 == chunks.len() {
+                                sender.write_all(payload).await.unwrap();
+                            }
+                            future::poll_fn(|cx| accepted.stream.poll_read(cx))
+                                .await
+                                .unwrap();
+                            if reset_before_parse && index + 1 == chunks.len() {
+                                sender.reset(quinn::VarInt::from_u32(42)).unwrap();
+                            }
+                            let parsed =
+                                future::poll_fn(|cx| accepted.poll_type(cx)).now_or_never();
+                            if index + 1 == chunks.len() {
+                                assert!(
+                                    matches!(parsed, Some(Ok(()))),
+                                    "id={id}, fragmented={fragmented}"
+                                );
+                            } else {
+                                assert!(parsed.is_none());
+                            }
+                        }
+                        let AcceptedRecvStream::WebTransportUni(session, mut stream) =
+                            accepted.into_stream()
+                        else {
+                            panic!("wrong stream type");
+                        };
+                        assert_eq!(session.into_inner(), id);
+                        let mut received = vec![0; payload.len()];
+                        tokio::io::AsyncReadExt::read_exact(&mut stream, &mut received)
+                            .await
+                            .unwrap();
+                        assert_eq!(received, payload);
+                        if !reset_before_parse {
+                            sender.reset(quinn::VarInt::from_u32(42)).unwrap();
+                        }
+                        assert!(matches!(
+                            future::poll_fn(|cx| stream.poll_data(cx)).await,
+                            Err(StreamErrorIncoming::StreamTerminated { error_code: 42 })
+                        ));
+                    }
+                }
+            }
+        })
+        .await
+        .expect("headers must resolve before FIN or more payload");
+    }
 
     #[test]
     fn write_wt_uni_header() {
