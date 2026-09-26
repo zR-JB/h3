@@ -77,7 +77,7 @@ where
                     Poll::Ready(false) => continue,
                     Poll::Pending => Poll::Pending,
                     Poll::Ready(true) => {
-                        if self.stream.buf_mut().has_remaining() {
+                        if self.stream.buf_mut().has_remaining() || self.decoder.skipped != 0 {
                             // Reached the end of receive stream, but there is still some data:
                             // The frame is incomplete.
                             Poll::Ready(Err(FrameStreamError::UnexpectedEnd))
@@ -205,6 +205,7 @@ where
 #[derive(Default)]
 pub struct FrameDecoder {
     expected: Option<usize>,
+    skipped: u64,
 }
 
 impl FrameDecoder {
@@ -215,6 +216,11 @@ impl FrameDecoder {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
+            if self.skipped != 0 {
+                let count = self.skipped.min(src.remaining() as u64) as usize;
+                src.advance(count);
+                self.skipped -= count as u64;
+            }
             if !src.has_remaining() {
                 return Ok(None);
             }
@@ -232,7 +238,7 @@ impl FrameDecoder {
             };
 
             match decoded {
-                Err(frame::FrameError::UnknownFrame(_ty)) => {
+                Err(frame::FrameError::UnknownFrame(_ty, remaining)) => {
                     //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
                     //# Endpoints MUST
                     //# NOT consider these frames to have any meaning upon receipt.
@@ -241,6 +247,7 @@ impl FrameDecoder {
 
                     src.advance(pos);
                     self.expected = None;
+                    self.skipped = remaining;
                     continue;
                 }
                 Err(frame::FrameError::Incomplete(min)) => {
@@ -276,6 +283,9 @@ impl FrameDecoder {
                         FrameProtocolError::InvalidFrameValue,
                     ));
                 }
+                Err(frame::FrameError::ExcessiveLoad) => {
+                    return Err(FrameStreamError::Proto(FrameProtocolError::ExcessiveLoad));
+                }
                 Err(frame::FrameError::Malformed) => {
                     return Err(FrameStreamError::Proto(FrameProtocolError::Malformed));
                 }
@@ -296,6 +306,7 @@ pub enum FrameStreamError {
 /// Protocol specific errors that can occur while decoding frames in a stream
 pub enum FrameProtocolError {
     Malformed,
+    ExcessiveLoad,
     ForbiddenFrame(u64), // Known (http2) frames that should generate an error
     InvalidFrameValue,
     Settings(SettingsError),
@@ -313,6 +324,109 @@ mod tests {
     use std::collections::VecDeque;
 
     use crate::proto::{coding::Encode, frame::FrameType, varint::VarInt};
+
+    #[tokio::test]
+    async fn oversized_buffered_frames_fail_before_payload_arrives() {
+        use crate::{
+            error::internal_error::InternalConnectionError, quic::Connection as _, tests::Pair,
+        };
+        use futures_util::FutureExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut pair = Pair::default();
+            let mut server = pair.server();
+            let (client, mut receiver) = tokio::join!(pair.client_inner(), server.next());
+            for (ty, length, payload, code) in [
+                (
+                    FrameType::HEADERS,
+                    VarInt::MAX.0,
+                    &[][..],
+                    Code::H3_EXCESSIVE_LOAD,
+                ),
+                (
+                    FrameType::PUSH_PROMISE,
+                    VarInt::MAX.0,
+                    &[][..],
+                    Code::H3_EXCESSIVE_LOAD,
+                ),
+                (
+                    FrameType::SETTINGS,
+                    VarInt::MAX.0,
+                    &[][..],
+                    Code::H3_EXCESSIVE_LOAD,
+                ),
+                (FrameType::GOAWAY, 9, &[][..], Code::H3_FRAME_ERROR),
+                (FrameType::CANCEL_PUSH, 9, &[][..], Code::H3_FRAME_ERROR),
+                (FrameType::MAX_PUSH_ID, 9, &[][..], Code::H3_FRAME_ERROR),
+                (FrameType::GOAWAY, 2, &[0, 0][..], Code::H3_FRAME_ERROR),
+                (FrameType::CANCEL_PUSH, 1, &[64][..], Code::H3_FRAME_ERROR),
+                (FrameType::MAX_PUSH_ID, 0, &[][..], Code::H3_FRAME_ERROR),
+            ] {
+                let mut header = Vec::new();
+                ty.encode(&mut header);
+                VarInt::from_u64(length).unwrap().encode(&mut header);
+                header.extend_from_slice(payload);
+                let mut sender = client.open_uni().await.unwrap();
+                sender.write_all(&header).await.unwrap();
+                let recv = poll_fn(|cx| receiver.poll_accept_recv(cx)).await.unwrap();
+                let mut stream = FrameStream::<_, Bytes>::new(BufRecvStream::new(recv));
+                poll_fn(|cx| stream.stream.poll_read(cx)).await.unwrap();
+                let Some(Err(FrameStreamError::Proto(error))) =
+                    poll_fn(|cx| stream.poll_next(cx)).now_or_never()
+                else {
+                    panic!("oversized frame must fail at its header");
+                };
+                assert_eq!(InternalConnectionError::got_frame_error(error).code, code);
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn large_unknown_frames_are_discarded_before_following_headers() {
+        use crate::{quic::Connection as _, tests::Pair};
+        use futures_util::FutureExt;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut pair = Pair::default();
+            let mut server = pair.server();
+            let (client, mut receiver) = tokio::join!(pair.client_inner(), server.next());
+            let mut sender = client.open_uni().await.unwrap();
+            let mut header = Vec::new();
+            VarInt::from_u32(0x21).encode(&mut header);
+            VarInt::from_u32(128 * 1024).encode(&mut header);
+            sender.write_all(&header).await.unwrap();
+            let recv = poll_fn(|cx| receiver.poll_accept_recv(cx)).await.unwrap();
+            let mut stream = FrameStream::<_, Bytes>::new(BufRecvStream::new(recv));
+            for _ in 0..32 {
+                sender.write_all(&[0; 4096]).await.unwrap();
+                poll_fn(|cx| stream.stream.poll_read(cx)).await.unwrap();
+                assert!(poll_fn(|cx| stream.poll_next(cx)).now_or_never().is_none());
+                assert_eq!(stream.stream.buf().remaining(), 0);
+            }
+            let mut following = Vec::new();
+            Frame::headers(b"valid".as_slice()).encode_with_payload(&mut following);
+            sender.write_all(&following).await.unwrap();
+            assert_matches!(poll_fn(|cx| stream.poll_next(cx)).await, Ok(Some(Frame::Headers(value))) if value == b"valid".as_slice());
+            header.clear();
+            VarInt::from_u32(0x21).encode(&mut header);
+            VarInt::MAX.encode(&mut header);
+            sender.write_all(&header).await.unwrap();
+            sender.finish().unwrap();
+            assert_matches!(poll_fn(|cx| stream.poll_next(cx)).await, Err(FrameStreamError::UnexpectedEnd));
+            let mut sender = client.open_uni().await.unwrap();
+            sender.write_all(&header).await.unwrap();
+            let recv = poll_fn(|cx| receiver.poll_accept_recv(cx)).await.unwrap();
+            let mut stream = FrameStream::<_, Bytes>::new(BufRecvStream::new(recv));
+            poll_fn(|cx| stream.stream.poll_read(cx)).await.unwrap();
+            assert!(poll_fn(|cx| stream.poll_next(cx)).now_or_never().is_none());
+            sender.reset(quinn::VarInt::from_u32(42)).unwrap();
+            assert_matches!(poll_fn(|cx| stream.poll_next(cx)).await,
+                Err(FrameStreamError::Quic(StreamErrorIncoming::StreamTerminated { error_code: 42 })));
+
+        }).await.unwrap();
+    }
 
     // Decoder
 

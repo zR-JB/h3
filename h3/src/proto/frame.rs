@@ -18,8 +18,9 @@ use super::{
 #[derive(Debug, PartialEq)]
 pub enum FrameError {
     Malformed,
-    UnsupportedFrame(u64), // Known frames that should generate an error
-    UnknownFrame(u64),     // Unknown frames that should be ignored
+    ExcessiveLoad,
+    UnsupportedFrame(u64),  // Known frames that should generate an error
+    UnknownFrame(u64, u64), // Unknown frame type and remaining payload
     InvalidFrameValue,
     Incomplete(usize),
     Settings(SettingsError),
@@ -33,8 +34,9 @@ impl fmt::Display for FrameError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             FrameError::Malformed => write!(f, "frame is malformed"),
+            FrameError::ExcessiveLoad => write!(f, "encoded frame exceeds the buffer limit"),
             FrameError::UnsupportedFrame(c) => write!(f, "frame 0x{:x} is not allowed h3", c),
-            FrameError::UnknownFrame(c) => write!(f, "frame 0x{:x} ignored", c),
+            FrameError::UnknownFrame(c, _) => write!(f, "frame 0x{:x} ignored", c),
             FrameError::InvalidFrameValue => write!(f, "frame value is invalid"),
             FrameError::Incomplete(x) => write!(f, "internal error: frame incomplete {}", x),
             FrameError::Settings(x) => write!(f, "invalid settings: {}", x),
@@ -97,44 +99,73 @@ impl Frame<PayloadLen> {
             .get_var()
             .map_err(|_| FrameError::Incomplete(remaining + 1))?;
 
-        if ty == FrameType::DATA {
-            return Ok(Frame::Data((len as usize).into()));
+        match ty {
+            FrameType::DATA => {
+                return Ok(Frame::Data(
+                    usize::try_from(len)
+                        .map_err(|_| FrameError::ExcessiveLoad)?
+                        .into(),
+                ));
+            }
+            FrameType::HEADERS | FrameType::PUSH_PROMISE | FrameType::SETTINGS => {
+                if len > 64 * 1024 {
+                    return Err(FrameError::ExcessiveLoad);
+                }
+            }
+            FrameType::CANCEL_PUSH | FrameType::GOAWAY | FrameType::MAX_PUSH_ID => {
+                if len > VarInt::MAX_SIZE as u64 {
+                    return Err(FrameError::Malformed);
+                }
+            }
+            FrameType::H2_PRIORITY
+            | FrameType::H2_PING
+            | FrameType::H2_WINDOW_UPDATE
+            | FrameType::H2_CONTINUATION => {
+                return Err(FrameError::UnsupportedFrame(ty.0));
+            }
+            _ => {
+                let consumed = len.min(buf.remaining() as u64) as usize;
+                buf.advance(consumed);
+                return Err(FrameError::UnknownFrame(ty.0, len - consumed as u64));
+            }
+        }
+        let len = len as usize;
+        if buf.remaining() < len {
+            return Err(FrameError::Incomplete(remaining - buf.remaining() + len));
         }
 
-        if buf.remaining() < len as usize {
-            return Err(FrameError::Incomplete(2 + len as usize));
-        }
-
-        let mut payload = buf.take(len as usize);
+        let mut payload = buf.take(len);
 
         #[cfg(feature = "tracing")]
         trace!("frame ty: {:?}", ty);
 
         let frame = match ty {
-            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len as usize))),
+            FrameType::HEADERS => Ok(Frame::Headers(payload.copy_to_bytes(len))),
             FrameType::SETTINGS => Ok(Frame::Settings(Settings::decode(&mut payload)?)),
-            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(payload.get_var()?.try_into()?)),
-            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(PushPromise::decode(&mut payload)?)),
-            FrameType::GOAWAY => Ok(Frame::Goaway(VarInt::decode(&mut payload)?)),
-            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(payload.get_var()?.try_into()?)),
-            //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-            //# These frame
-            //# types MUST NOT be sent, and their receipt MUST be treated as a
-            //# connection error of type H3_FRAME_UNEXPECTED.
-            FrameType::H2_PRIORITY
-            | FrameType::H2_PING
-            | FrameType::H2_WINDOW_UPDATE
-            | FrameType::H2_CONTINUATION => Err(FrameError::UnsupportedFrame(ty.0)),
-            FrameType::WEBTRANSPORT_BI_STREAM | FrameType::DATA => unreachable!(),
-            _ => {
-                buf.advance(len as usize);
-                //= https://www.rfc-editor.org/rfc/rfc9114#section-7.2.8
-                //# Endpoints MUST
-                //# NOT consider these frames to have any meaning upon receipt.
-                Err(FrameError::UnknownFrame(ty.0))
-            }
+            FrameType::CANCEL_PUSH => Ok(Frame::CancelPush(
+                payload
+                    .get_var()
+                    .map_err(|_| FrameError::Malformed)?
+                    .try_into()?,
+            )),
+            FrameType::PUSH_PROMISE => Ok(Frame::PushPromise(
+                PushPromise::decode(&mut payload).map_err(|_| FrameError::Malformed)?,
+            )),
+            FrameType::GOAWAY => Ok(Frame::Goaway(
+                VarInt::decode(&mut payload).map_err(|_| FrameError::Malformed)?,
+            )),
+            FrameType::MAX_PUSH_ID => Ok(Frame::MaxPushId(
+                payload
+                    .get_var()
+                    .map_err(|_| FrameError::Malformed)?
+                    .try_into()?,
+            )),
+            _ => unreachable!(),
         };
 
+        if payload.has_remaining() {
+            return Err(FrameError::Malformed);
+        }
         if let Ok(_frame) = &frame {
             #[cfg(feature = "tracing")]
             trace!(
@@ -626,7 +657,10 @@ mod tests {
     #[test]
     fn unknown_frame_type() {
         let mut buf = Cursor::new(&[22, 4, 0, 255, 128, 0, 3, 1, 2]);
-        assert_matches!(Frame::decode(&mut buf), Err(FrameError::UnknownFrame(22)));
+        assert_matches!(
+            Frame::decode(&mut buf),
+            Err(FrameError::UnknownFrame(22, 0))
+        );
         assert_matches!(Frame::decode(&mut buf), Ok(Frame::CancelPush(PushId(2))));
     }
 
@@ -765,6 +799,6 @@ mod tests {
         raw.extend(&[6, 0, 255, 128, 0, 250, 218]);
         let mut buf = Cursor::new(&raw);
         let decoded = Frame::decode(&mut buf);
-        assert_matches!(decoded, Err(FrameError::UnknownFrame(95)));
+        assert_matches!(decoded, Err(FrameError::UnknownFrame(95, 0)));
     }
 }

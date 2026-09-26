@@ -29,6 +29,10 @@ impl InternalConnectionError {
     /// Creates a new internal connection error from a frame error
     pub fn got_frame_error(value: FrameProtocolError) -> Self {
         match value {
+            FrameProtocolError::ExcessiveLoad => InternalConnectionError {
+                code: Code::H3_EXCESSIVE_LOAD,
+                message: "encoded frame exceeds the buffer limit".to_string(),
+            },
             FrameProtocolError::InvalidStreamId(id) => InternalConnectionError {
                 code: Code::H3_ID_ERROR,
                 message: format!("invalid stream id: {}", id),
