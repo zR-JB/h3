@@ -38,7 +38,7 @@ impl FromStr for Protocol {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "webtransport" => Ok(Self(ProtocolInner::WebTransport)),
+            "webtransport" | "webtransport-h3" => Ok(Self(ProtocolInner::WebTransport)),
             "connect-udp" => Ok(Self(ProtocolInner::ConnectUdp)),
             _ => Err(InvalidProtocol),
         }
