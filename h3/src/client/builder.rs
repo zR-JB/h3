@@ -111,6 +111,18 @@ impl Builder {
         self
     }
 
+    /// Enable WebTransport stream classification and current/legacy settings.
+    pub fn enable_webtransport(&mut self, value: bool) -> &mut Self {
+        self.config.settings.enable_webtransport = value;
+        self
+    }
+
+    /// Maximum concurrent WebTransport sessions advertised to the peer.
+    pub fn max_webtransport_sessions(&mut self, value: u64) -> &mut Self {
+        self.config.settings.max_webtransport_sessions = value;
+        self
+    }
+
     /// Create a new HTTP/3 client from a `quic` connection
     pub async fn build<C, O, B>(
         &mut self,
