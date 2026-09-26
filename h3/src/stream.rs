@@ -394,7 +394,7 @@ pin_project! {
     /// Implements `quic::RecvStream` which will first return buffered data, and then read from the
     /// stream
     pub struct BufRecvStream<S, B> {
-        buf: BufList<Bytes>,
+        buf: BufList,
         // Indicates that the end of the stream has been reached
         //
         // Data may still be available as buffered
@@ -443,7 +443,7 @@ impl<B, S: RecvStream> BufRecvStream<S, B> {
 
     /// Returns the currently buffered data, allowing it to be partially read
     #[inline]
-    pub(crate) fn buf_mut(&mut self) -> &mut BufList<Bytes> {
+    pub(crate) fn buf_mut(&mut self) -> &mut BufList {
         &mut self.buf
     }
 
@@ -460,7 +460,7 @@ impl<B, S: RecvStream> BufRecvStream<S, B> {
     }
 
     #[inline]
-    pub(crate) fn buf(&self) -> &BufList<Bytes> {
+    pub(crate) fn buf(&self) -> &BufList {
         &self.buf
     }
 

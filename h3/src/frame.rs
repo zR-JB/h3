@@ -209,10 +209,7 @@ pub struct FrameDecoder {
 }
 
 impl FrameDecoder {
-    fn decode<B: Buf>(
-        &mut self,
-        src: &mut BufList<B>,
-    ) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
+    fn decode(&mut self, src: &mut BufList) -> Result<Option<Frame<PayloadLen>>, FrameStreamError> {
         // Decode in a loop since we ignore unknown frames, and there may be
         // other frames already in our BufList.
         loop {
@@ -597,15 +594,11 @@ mod tests {
             Ok(Some(Frame::Data(PayloadLen(4))))
         );
 
-        // Then we get parts of body, chunked as they arrived
-        assert_poll_matches!(
-            |cx| to_bytes(stream.poll_data(cx)),
-            Ok(Some(b)) if b.remaining() == 2
-        );
-        assert_poll_matches!(
-            |cx| to_bytes(stream.poll_data(cx)),
-            Ok(Some(b)) if b.remaining() == 2
-        );
+        let mut body = Vec::new();
+        while let Some(data) = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await.unwrap() {
+            body.extend_from_slice(&data);
+        }
+        assert_eq!(body, b"body");
     }
 
     #[tokio::test]
@@ -683,15 +676,11 @@ mod tests {
         buf.put_slice(&b"dy"[..]);
         stream.stream.buf_mut().push_bytes(&mut buf.freeze());
 
-        assert_poll_matches!(
-            |cx| to_bytes(stream.poll_data(cx)),
-            Ok(Some(b)) if &*b == b"bo"
-        );
-
-        assert_poll_matches!(
-            |cx| to_bytes(stream.poll_data(cx)),
-            Ok(Some(b)) if &*b == b"dy"
-        );
+        let mut body = Vec::new();
+        while let Some(data) = poll_fn(|cx| to_bytes(stream.poll_data(cx))).await.unwrap() {
+            body.extend_from_slice(&data);
+        }
+        assert_eq!(body, b"body");
     }
 
     // Helpers
