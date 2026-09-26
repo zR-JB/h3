@@ -276,6 +276,10 @@ where
     S: RecvStream,
     B: Buf,
 {
+    pub(super) fn recv_id(&self) -> quic::StreamId {
+        self.stream.recv_id()
+    }
+
     pub fn new(stream: S) -> Self {
         Self {
             stream: BufRecvStream::new(stream),
