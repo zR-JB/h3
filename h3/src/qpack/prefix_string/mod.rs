@@ -21,6 +21,7 @@ use crate::qpack::prefix_int::{self, Error as IntegerError};
 #[derive(Debug, PartialEq)]
 pub enum Error {
     UnexpectedEnd,
+    TooLong(usize),
     Integer(IntegerError),
     HuffmanDecoding(HuffmanDecodingError),
     HuffmanEncoding(HuffmanEncodingError),
@@ -30,6 +31,7 @@ pub enum Error {
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Error::TooLong(_) => write!(f, "decoded string too long"),
             Error::UnexpectedEnd => write!(f, "unexpected end"),
             Error::Integer(e) => write!(f, "could not parse integer: {}", e),
             Error::HuffmanDecoding(e) => write!(f, "Huffman decode failed: {:?}", e),
@@ -39,19 +41,39 @@ impl std::fmt::Display for Error {
     }
 }
 
-pub fn decode<B: Buf>(size: u8, buf: &mut B) -> Result<Vec<u8>, Error> {
+pub fn decode<B: Buf>(size: u8, buf: &mut B, max_len: usize) -> Result<Vec<u8>, Error> {
     let (flags, len) = prefix_int::decode(size - 1, buf)?;
     let len: usize = len.try_into()?;
     if buf.remaining() < len {
         return Err(Error::UnexpectedEnd);
     }
 
+    let encoded_limit = if flags & 1 == 0 {
+        max_len
+    } else {
+        max_len
+            .checked_mul(30)
+            .and_then(|bits| bits.checked_add(7))
+            .map(|bits| bits / 8)
+            .unwrap_or(usize::MAX)
+    };
+    if len > encoded_limit {
+        return Err(Error::TooLong(max_len.saturating_add(1)));
+    }
     let payload = buf.copy_to_bytes(len);
     let value = if flags & 1 == 0 {
         payload.into_iter().collect()
     } else {
-        let mut decoded = Vec::new();
-        for byte in payload.into_iter().collect::<Vec<u8>>().hpack_decode() {
+        let mut decoded_len = 0;
+        for byte in payload.as_ref().hpack_decode() {
+            byte?;
+            if decoded_len == max_len {
+                return Err(Error::TooLong(max_len.saturating_add(1)));
+            }
+            decoded_len += 1;
+        }
+        let mut decoded = Vec::with_capacity(decoded_len);
+        for byte in payload.as_ref().hpack_decode() {
             decoded.push(byte?);
         }
         decoded
@@ -102,6 +124,27 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    fn decoded_allowance_bounds_plain_and_huffman_strings() {
+        for huffman in [false, true] {
+            let mut encoded = Vec::new();
+            if huffman {
+                encode(8, 0, b"aaaaaaaa", &mut encoded).unwrap();
+            } else {
+                prefix_int::encode(7, 0, 8, &mut encoded);
+                encoded.extend_from_slice(b"aaaaaaaa");
+            }
+            assert_eq!(
+                decode(8, &mut Cursor::new(&encoded), 8).unwrap(),
+                b"aaaaaaaa"
+            );
+            assert_eq!(
+                decode(8, &mut Cursor::new(&encoded), 7),
+                Err(Error::TooLong(8))
+            );
+        }
+    }
+
+    #[test]
     fn codec_6() {
         let mut buf = Vec::new();
         encode(6, 0b01, b"name without ref", &mut buf).unwrap();
@@ -124,7 +167,10 @@ mod tests {
                 127
             ]
         );
-        assert_eq!(decode(6, &mut read).unwrap(), b"name without ref");
+        assert_eq!(
+            decode(6, &mut read, usize::MAX).unwrap(),
+            b"name without ref"
+        );
     }
 
     #[test]
@@ -136,7 +182,7 @@ mod tests {
             &buf,
             &[0b1000_1010, 168, 116, 149, 79, 6, 76, 234, 88, 89, 127]
         );
-        assert_eq!(decode(8, &mut read).unwrap(), b"name with ref");
+        assert_eq!(decode(8, &mut read, usize::MAX).unwrap(), b"name with ref");
     }
 
     #[test]
@@ -145,20 +191,20 @@ mod tests {
         encode(8, 0b01, b"", &mut buf).unwrap();
         let mut read = Cursor::new(&buf);
         assert_eq!(&buf, &[0b1000_0000]);
-        assert_eq!(decode(8, &mut read).unwrap(), b"");
+        assert_eq!(decode(8, &mut read, usize::MAX).unwrap(), b"");
     }
 
     #[test]
     fn decode_non_huffman() {
         let buf = vec![0b0100_0011, b'b', b'a', b'r'];
         let mut read = Cursor::new(&buf);
-        assert_eq!(decode(6, &mut read).unwrap(), b"bar");
+        assert_eq!(decode(6, &mut read, usize::MAX).unwrap(), b"bar");
     }
 
     #[test]
     fn decode_too_short() {
         let buf = vec![0b0100_0011, b'b', b'a'];
         let mut read = Cursor::new(&buf);
-        assert_matches!(decode(6, &mut read), Err(Error::UnexpectedEnd));
+        assert_matches!(decode(6, &mut read, usize::MAX), Err(Error::UnexpectedEnd));
     }
 }

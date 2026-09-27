@@ -6,16 +6,13 @@ use tracing::trace;
 
 use super::{
     dynamic::{DynamicTable, DynamicTableDecoder, Error as DynamicTableError},
-    field::HeaderField,
+    field::{HeaderField, ESTIMATED_OVERHEAD_BYTES},
     static_::{Error as StaticError, StaticTable},
     vas,
 };
 
 use super::{
-    block::{
-        HeaderBlockField, HeaderPrefix, Indexed, IndexedWithPostBase, Literal, LiteralWithNameRef,
-        LiteralWithPostBaseNameRef,
-    },
+    block::{HeaderBlockField, HeaderPrefix, Indexed, IndexedWithPostBase, Literal},
     parse_error::ParseError,
     stream::{
         Duplicate, DynamicTableSizeUpdate, EncoderInstruction, HeaderAck, InsertCountIncrement,
@@ -38,6 +35,15 @@ pub enum DecoderError {
     UnexpectedEnd,
     HeaderTooLong(u64),
     BufSize(TryFromIntError),
+}
+
+impl DecoderError {
+    fn with_header_limit(self, limit: u64) -> Self {
+        match self {
+            Self::HeaderTooLong(_) => Self::HeaderTooLong(limit.saturating_add(1)),
+            error => error,
+        }
+    }
 }
 
 impl std::error::Error for DecoderError {}
@@ -85,7 +91,11 @@ pub struct Decoder {
 impl Decoder {
     // Decode field lines received on Request of Push stream.
     // https://www.rfc-editor.org/rfc/rfc9204.html#name-field-line-representations
-    pub fn decode_header<T: Buf>(&self, buf: &mut T) -> Result<Decoded, DecoderError> {
+    pub fn decode_header<T: Buf>(
+        &self,
+        buf: &mut T,
+        max_size: u64,
+    ) -> Result<Decoded, DecoderError> {
         let (required_ref, base) = HeaderPrefix::decode(buf)?
             .get(self.table.total_inserted(), self.table.max_mem_size())?;
 
@@ -98,8 +108,21 @@ impl Decoder {
         let mut mem_size = 0;
         let mut fields = Vec::new();
         while buf.has_remaining() {
-            let field = Self::parse_header_field(&decoder_table, buf)?;
+            let field = Self::parse_header_field(
+                &decoder_table,
+                buf,
+                usize::try_from(
+                    max_size
+                        .saturating_sub(mem_size)
+                        .saturating_sub(ESTIMATED_OVERHEAD_BYTES as u64),
+                )
+                .unwrap_or(usize::MAX),
+            )
+            .map_err(|error| error.with_header_limit(max_size))?;
             mem_size += field.mem_size() as u64;
+            if mem_size > max_size {
+                return Err(DecoderError::HeaderTooLong(mem_size));
+            }
             fields.push(field);
         }
 
@@ -150,15 +173,25 @@ impl Decoder {
             EncoderInstruction::DynamicTableSizeUpdate => {
                 DynamicTableSizeUpdate::decode(&mut buf)?.map(|x| Instruction::TableSizeUpdate(x.0))
             }
-            EncoderInstruction::InsertWithoutNameRef => InsertWithoutNameRef::decode(&mut buf)?
-                .map(|x| Instruction::Insert(HeaderField::new(x.name, x.value))),
+            EncoderInstruction::InsertWithoutNameRef => InsertWithoutNameRef::decode(
+                &mut buf,
+                self.table
+                    .max_mem_size()
+                    .saturating_sub(ESTIMATED_OVERHEAD_BYTES),
+            )?
+            .map(|x| Instruction::Insert(HeaderField::new(x.name, x.value))),
             EncoderInstruction::Duplicate => match Duplicate::decode(&mut buf)? {
                 Some(Duplicate(index)) => {
                     Some(Instruction::Insert(self.table.get_relative(index)?.clone()))
                 }
                 None => None,
             },
-            EncoderInstruction::InsertWithNameRef => match InsertWithNameRef::decode(&mut buf)? {
+            EncoderInstruction::InsertWithNameRef => match InsertWithNameRef::decode(
+                &mut buf,
+                self.table
+                    .max_mem_size()
+                    .saturating_sub(ESTIMATED_OVERHEAD_BYTES),
+            )? {
                 Some(InsertWithNameRef::Static { index, value }) => Some(Instruction::Insert(
                     StaticTable::get(index)?.with_value(value),
                 )),
@@ -180,6 +213,7 @@ impl Decoder {
     fn parse_header_field<R: Buf>(
         table: &DynamicTableDecoder,
         buf: &mut R,
+        max_len: usize,
     ) -> Result<HeaderField, DecoderError> {
         let first = buf.chunk()[0];
         let field = match HeaderBlockField::decode(first) {
@@ -191,20 +225,29 @@ impl Decoder {
                 let index = IndexedWithPostBase::decode(buf)?.0;
                 table.get_postbase(index)?.clone()
             }
-            HeaderBlockField::LiteralWithNameRef => match LiteralWithNameRef::decode(buf)? {
-                LiteralWithNameRef::Static { index, value } => {
-                    StaticTable::get(index)?.with_value(value)
-                }
-                LiteralWithNameRef::Dynamic { index, value } => {
-                    table.get_relative(index)?.with_value(value)
-                }
-            },
+            HeaderBlockField::LiteralWithNameRef => {
+                let (flags, index) = prefix_int::decode(4, buf)?;
+                let index = index.try_into()?;
+                let field = if flags & 1 != 0 {
+                    StaticTable::get(index)?
+                } else {
+                    table.get_relative(index)?
+                };
+                let allowance = max_len
+                    .checked_sub(field.name.len())
+                    .ok_or(DecoderError::HeaderTooLong(field.mem_size() as u64))?;
+                field.with_value(prefix_string::decode(8, buf, allowance)?)
+            }
             HeaderBlockField::LiteralWithPostBaseNameRef => {
-                let literal = LiteralWithPostBaseNameRef::decode(buf)?;
-                table.get_postbase(literal.index)?.with_value(literal.value)
+                let (_, index) = prefix_int::decode(3, buf)?;
+                let field = table.get_postbase(index.try_into()?)?;
+                let allowance = max_len
+                    .checked_sub(field.name.len())
+                    .ok_or(DecoderError::HeaderTooLong(field.mem_size() as u64))?;
+                field.with_value(prefix_string::decode(8, buf, allowance)?)
             }
             HeaderBlockField::Literal => {
-                let literal = Literal::decode(buf)?;
+                let literal = Literal::decode(buf, max_len)?;
                 HeaderField::new(literal.name, literal.value)
             }
             _ => return Err(DecoderError::UnknownPrefix(first)),
@@ -225,6 +268,12 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
     let mut mem_size = 0;
     let mut fields = Vec::new();
     while buf.has_remaining() {
+        let max_len = usize::try_from(
+            max_size
+                .saturating_sub(mem_size)
+                .saturating_sub(ESTIMATED_OVERHEAD_BYTES as u64),
+        )
+        .unwrap_or(usize::MAX);
         let field = match HeaderBlockField::decode(buf.chunk()[0]) {
             HeaderBlockField::IndexedWithPostBase => return Err(DecoderError::MissingRefs(0)),
             HeaderBlockField::LiteralWithPostBaseNameRef => {
@@ -234,14 +283,23 @@ pub fn decode_stateless<T: Buf>(buf: &mut T, max_size: u64) -> Result<Decoded, D
                 Indexed::Static(index) => StaticTable::get(index)?.clone(),
                 Indexed::Dynamic(_) => return Err(DecoderError::MissingRefs(0)),
             },
-            HeaderBlockField::LiteralWithNameRef => match LiteralWithNameRef::decode(buf)? {
-                LiteralWithNameRef::Dynamic { .. } => return Err(DecoderError::MissingRefs(0)),
-                LiteralWithNameRef::Static { index, value } => {
-                    StaticTable::get(index)?.with_value(value)
+            HeaderBlockField::LiteralWithNameRef => {
+                let (flags, index) = prefix_int::decode(4, buf)?;
+                if flags & 1 == 0 {
+                    return Err(DecoderError::MissingRefs(0));
                 }
-            },
+                let field = StaticTable::get(index.try_into()?)?;
+                let allowance = max_len
+                    .checked_sub(field.name.len())
+                    .ok_or(DecoderError::HeaderTooLong(max_size.saturating_add(1)))?;
+                field.with_value(
+                    prefix_string::decode(8, buf, allowance)
+                        .map_err(|error| DecoderError::from(error).with_header_limit(max_size))?,
+                )
+            }
             HeaderBlockField::Literal => {
-                let literal = Literal::decode(buf)?;
+                let literal = Literal::decode(buf, max_len)
+                    .map_err(|error| DecoderError::from(error).with_header_limit(max_size))?;
                 HeaderField::new(literal.name, literal.value)
             }
             _ => return Err(DecoderError::UnknownPrefix(buf.chunk()[0])),
@@ -298,6 +356,7 @@ impl From<prefix_string::Error> for DecoderError {
     fn from(e: prefix_string::Error) -> Self {
         match e {
             prefix_string::Error::UnexpectedEnd => DecoderError::UnexpectedEnd,
+            prefix_string::Error::TooLong(size) => DecoderError::HeaderTooLong(size as u64),
             e => DecoderError::InvalidString(e),
         }
     }
@@ -327,7 +386,7 @@ impl From<ParseError> for DecoderError {
     fn from(e: ParseError) -> Self {
         match e {
             ParseError::Integer(x) => DecoderError::InvalidInteger(x),
-            ParseError::String(x) => DecoderError::InvalidString(x),
+            ParseError::String(x) => x.into(),
             ParseError::InvalidPrefix(p) => DecoderError::UnknownPrefix(p),
             ParseError::InvalidBase(b) => DecoderError::BadBaseIndex(b),
         }
@@ -343,6 +402,7 @@ impl From<TryFromIntError> for DecoderError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qpack::block::{LiteralWithNameRef, LiteralWithPostBaseNameRef};
     use crate::qpack::tests::helpers::{build_table_with_size, TABLE_SIZE};
 
     #[test]
@@ -356,7 +416,73 @@ mod tests {
             crate::proto::headers::Header::trailer(trailers),
         );
         let result = decode_stateless(&mut buf, 2);
-        assert_eq!(result, Err(DecoderError::HeaderTooLong(44)));
+        assert!(matches!(result, Err(DecoderError::HeaderTooLong(_))));
+    }
+
+    #[test]
+    fn oversized_literal_stops_before_payload_copy() {
+        for huffman in [false, true] {
+            let mut block = vec![0, 0];
+            prefix_string::encode(4, 0b0010, b"x", &mut block).unwrap();
+            prefix_int::encode(7, u8::from(huffman), 1024 * 1024, &mut block);
+            let payload_offset = block.len();
+            block.resize(payload_offset + 1024 * 1024, b'a');
+            let mut read = Cursor::new(&block);
+            assert!(matches!(
+                decode_stateless(&mut read, 4096),
+                Err(DecoderError::HeaderTooLong(4097))
+            ));
+            assert_eq!(read.position() as usize, payload_offset);
+        }
+    }
+
+    #[test]
+    fn literal_huffman_and_referenced_names_obey_remaining_allowance() {
+        for referenced in [false, true] {
+            let mut block = vec![0, 0];
+            Literal::new("first", "value").encode(&mut block).unwrap();
+            if referenced {
+                LiteralWithNameRef::new_static(18, "aaaaaaaa")
+                    .encode(&mut block)
+                    .unwrap();
+            } else {
+                Literal::new("x", "aaaaaaaa").encode(&mut block).unwrap();
+            }
+            let field_name_len = if referenced {
+                StaticTable::get(18).unwrap().name.len()
+            } else {
+                1
+            };
+            let exact_size = 42 + 32 + field_name_len as u64 + 8;
+            let mut valid = Cursor::new(&block);
+            assert_eq!(
+                decode_stateless(&mut valid, exact_size).unwrap().mem_size,
+                exact_size
+            );
+            let mut oversized = Cursor::new(&block);
+            assert!(matches!(
+                decode_stateless(&mut oversized, exact_size - 1),
+                Err(DecoderError::HeaderTooLong(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn dynamic_header_decoder_bounds_literal_output() {
+        let decoder = Decoder::from(DynamicTable::new());
+        let mut block = vec![0, 0];
+        Literal::new("x", "aaaaaaaa").encode(&mut block).unwrap();
+        assert_eq!(
+            decoder
+                .decode_header(&mut Cursor::new(&block), 41)
+                .unwrap()
+                .mem_size,
+            41
+        );
+        assert!(matches!(
+            decoder.decode_header(&mut Cursor::new(&block), 40),
+            Err(DecoderError::HeaderTooLong(41))
+        ));
     }
 
     /**
@@ -568,7 +694,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         assert_eq!(
-            decoder.decode_header(&mut read),
+            decoder.decode_header(&mut read, u64::MAX),
             Err(DecoderError::MissingRefs(8))
         );
     }
@@ -599,7 +725,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(2));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -631,7 +757,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(fields, &[field(2), field(3), field(4)])
     }
@@ -651,7 +777,7 @@ mod tests {
         let decoder = Decoder::from(build_table_with_size(4));
         let Decoded {
             fields, dyn_ref, ..
-        } = decoder.decode_header(&mut read).unwrap();
+        } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert!(dyn_ref);
         assert_eq!(
             fields,
@@ -672,7 +798,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(3).with_value("new bar3")]);
     }
 
@@ -684,7 +810,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(0));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(
             fields,
             &[HeaderField::new(b"foo".to_vec(), b"bar".to_vec())]
@@ -714,7 +840,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(4));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(1), field(2), field(3), field(4)]);
     }
 
@@ -737,7 +863,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(build_table_with_size(max_entries + 10));
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).expect("decode");
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).expect("decode");
         assert_eq!(fields, &[field(max_entries - 5)]);
 
         let mut buf = vec![];
@@ -755,7 +881,7 @@ mod tests {
 
         let mut read = Cursor::new(&buf);
         let decoder = Decoder::from(table);
-        let Decoded { fields, .. } = decoder.decode_header(&mut read).unwrap();
+        let Decoded { fields, .. } = decoder.decode_header(&mut read, u64::MAX).unwrap();
         assert_eq!(fields, &[field(max_entries + 6), field(max_entries + 10)]);
     }
 }

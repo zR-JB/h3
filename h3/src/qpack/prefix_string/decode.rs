@@ -296,7 +296,7 @@ bits_decode![
 
 pub struct DecodeIter<'a> {
     bit_pos: BitWindow,
-    content: &'a Vec<u8>,
+    content: &'a [u8],
 }
 
 impl<'a> Iterator for DecodeIter<'a> {
@@ -312,11 +312,11 @@ impl<'a> Iterator for DecodeIter<'a> {
 }
 
 pub trait HpackStringDecode {
-    fn hpack_decode(&self) -> DecodeIter;
+    fn hpack_decode(&self) -> DecodeIter<'_>;
 }
 
-impl HpackStringDecode for Vec<u8> {
-    fn hpack_decode(&self) -> DecodeIter {
+impl HpackStringDecode for [u8] {
+    fn hpack_decode(&self) -> DecodeIter<'_> {
         DecodeIter {
             bit_pos: BitWindow::new(),
             content: self,

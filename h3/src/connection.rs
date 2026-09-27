@@ -812,7 +812,10 @@ where
     /// Stream IDs still awaiting a unidirectional stream type or association
     /// header. The connection owner may apply its own header deadline.
     pub fn pending_recv_stream_ids(&self) -> impl Iterator<Item = quic::StreamId> + '_ {
-        self.pending_recv_streams.iter().flatten().map(|stream| stream.recv_id())
+        self.pending_recv_streams
+            .iter()
+            .flatten()
+            .map(|stream| stream.recv_id())
     }
 }
 

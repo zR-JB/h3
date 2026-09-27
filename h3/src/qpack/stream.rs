@@ -90,7 +90,7 @@ impl InsertWithNameRef {
         }
     }
 
-    pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
+    pub fn decode<R: Buf>(buf: &mut R, max_len: usize) -> Result<Option<Self>, ParseError> {
         let (flags, index) = match prefix_int::decode(6, buf) {
             Ok((f, x)) if f & 0b10 == 0b10 => (f, x),
             Ok((f, _)) => return Err(ParseError::InvalidPrefix(f)),
@@ -101,7 +101,7 @@ impl InsertWithNameRef {
             .try_into()
             .map_err(|_e| ParseError::Integer(crate::qpack::prefix_int::Error::Overflow))?;
 
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode(8, buf, max_len) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -143,13 +143,13 @@ impl InsertWithoutNameRef {
         }
     }
 
-    pub fn decode<R: Buf>(buf: &mut R) -> Result<Option<Self>, ParseError> {
-        let name = match prefix_string::decode(6, buf) {
+    pub fn decode<R: Buf>(buf: &mut R, max_len: usize) -> Result<Option<Self>, ParseError> {
+        let name = match prefix_string::decode(6, buf, max_len) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        let value = match prefix_string::decode(8, buf) {
+        let value = match prefix_string::decode(8, buf, max_len - name.len()) {
             Ok(x) => x,
             Err(StringError::UnexpectedEnd) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -337,7 +337,10 @@ mod test {
         let mut buf = vec![];
         instruction.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
-        assert_eq!(InsertWithNameRef::decode(&mut read), Ok(Some(instruction)));
+        assert_eq!(
+            InsertWithNameRef::decode(&mut read, usize::MAX),
+            Ok(Some(instruction))
+        );
     }
 
     #[test]
@@ -347,7 +350,7 @@ mod test {
         instruction.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
         assert_eq!(
-            InsertWithoutNameRef::decode(&mut read),
+            InsertWithoutNameRef::decode(&mut read, usize::MAX),
             Ok(Some(instruction))
         );
     }

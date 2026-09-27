@@ -288,7 +288,7 @@ impl LiteralWithNameRef {
         }
     }
 
-    pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+    pub fn decode<R: Buf>(buf: &mut R, max_len: usize) -> Result<Self, ParseError> {
         match prefix_int::decode(4, buf)? {
             (f, i) if f & 0b0101 == 0b0101 => {
                 if i > (usize::MAX as u64) {
@@ -299,7 +299,7 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_static(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
+                    prefix_string::decode(8, buf, max_len)?,
                 ))
             }
             (f, i) if f & 0b0101 == 0b0100 => {
@@ -311,7 +311,7 @@ impl LiteralWithNameRef {
 
                 Ok(LiteralWithNameRef::new_dynamic(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
+                    prefix_string::decode(8, buf, max_len)?,
                 ))
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
@@ -347,7 +347,7 @@ impl LiteralWithPostBaseNameRef {
         }
     }
 
-    pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+    pub fn decode<R: Buf>(buf: &mut R, max_len: usize) -> Result<Self, ParseError> {
         match prefix_int::decode(3, buf)? {
             (f, i) if f & 0b1111_0000 == 0 => {
                 if i > (usize::MAX as u64) {
@@ -358,7 +358,7 @@ impl LiteralWithPostBaseNameRef {
 
                 Ok(LiteralWithPostBaseNameRef::new(
                     i as usize,
-                    prefix_string::decode(8, buf)?,
+                    prefix_string::decode(8, buf, max_len)?,
                 ))
             }
             (f, _) => Err(ParseError::InvalidPrefix(f)),
@@ -386,16 +386,15 @@ impl Literal {
         }
     }
 
-    pub fn decode<R: Buf>(buf: &mut R) -> Result<Self, ParseError> {
+    pub fn decode<R: Buf>(buf: &mut R, max_len: usize) -> Result<Self, ParseError> {
         if buf.remaining() < 1 {
             return Err(ParseError::Integer(prefix_int::Error::UnexpectedEnd));
         } else if buf.chunk()[0] & 0b1110_0000 != 0b0010_0000 {
             return Err(ParseError::InvalidPrefix(buf.chunk()[0]));
         }
-        Ok(Literal::new(
-            prefix_string::decode(4, buf)?,
-            prefix_string::decode(8, buf)?,
-        ))
+        let name = prefix_string::decode(4, buf, max_len)?;
+        let value = prefix_string::decode(8, buf, max_len - name.len())?;
+        Ok(Literal::new(name, value))
     }
 
     pub fn encode<W: BufMut>(&self, buf: &mut W) -> Result<(), prefix_string::Error> {
@@ -446,7 +445,7 @@ mod test {
         let mut buf = vec![];
         field.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
-        assert_eq!(LiteralWithNameRef::decode(&mut read), Ok(field));
+        assert_eq!(LiteralWithNameRef::decode(&mut read, usize::MAX), Ok(field));
     }
 
     #[test]
@@ -455,7 +454,10 @@ mod test {
         let mut buf = vec![];
         field.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
-        assert_eq!(LiteralWithPostBaseNameRef::decode(&mut read), Ok(field));
+        assert_eq!(
+            LiteralWithPostBaseNameRef::decode(&mut read, usize::MAX),
+            Ok(field)
+        );
     }
 
     #[test]
@@ -464,7 +466,7 @@ mod test {
         let mut buf = vec![];
         field.encode(&mut buf).unwrap();
         let mut read = Cursor::new(&buf);
-        assert_eq!(Literal::decode(&mut read), Ok(field));
+        assert_eq!(Literal::decode(&mut read, usize::MAX), Ok(field));
     }
 
     #[test]

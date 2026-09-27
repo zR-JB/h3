@@ -355,7 +355,7 @@ mod tests {
                 Ok(IndexedWithPostBase(0))
             );
             assert_eq!(
-                InsertWithNameRef::decode(&mut e),
+                InsertWithNameRef::decode(&mut e, usize::MAX),
                 Ok(Some(InsertWithNameRef::new_static(12, "/bar")))
             );
         });
@@ -379,7 +379,7 @@ mod tests {
                 Ok(IndexedWithPostBase(0))
             );
             assert_eq!(
-                InsertWithoutNameRef::decode(&mut e),
+                InsertWithoutNameRef::decode(&mut e, usize::MAX),
                 Ok(Some(InsertWithoutNameRef::new("foo", "bar")))
             );
         });
@@ -397,7 +397,7 @@ mod tests {
                     Ok(IndexedWithPostBase(0))
                 );
                 assert_eq!(
-                    InsertWithNameRef::decode(&mut e),
+                    InsertWithNameRef::decode(&mut e, usize::MAX),
                     Ok(Some(InsertWithNameRef::new_dynamic(1, "quxx")))
                 );
             },
@@ -410,7 +410,10 @@ mod tests {
         table.set_max_size(0).unwrap();
         let field = HeaderField::new("foo", "bar");
         check_encode_field_table(&mut table, &[], &[field], 1, &|mut b, e| {
-            assert_eq!(Literal::decode(&mut b), Ok(Literal::new("foo", "bar")));
+            assert_eq!(
+                Literal::decode(&mut b, usize::MAX),
+                Ok(Literal::new("foo", "bar"))
+            );
             assert_eq!(e.get_ref().len(), 0);
         });
     }
@@ -434,7 +437,7 @@ mod tests {
             2,
             &|mut b, e| {
                 assert_eq!(
-                    LiteralWithNameRef::decode(&mut b),
+                    LiteralWithNameRef::decode(&mut b, usize::MAX),
                     Ok(LiteralWithNameRef::new_dynamic(0, "quxx"))
                 );
                 assert_eq!(e.get_ref().len(), 0);
@@ -458,11 +461,11 @@ mod tests {
                     Ok(IndexedWithPostBase(0))
                 );
                 assert_eq!(
-                    LiteralWithPostBaseNameRef::decode(&mut b),
+                    LiteralWithPostBaseNameRef::decode(&mut b, usize::MAX),
                     Ok(LiteralWithPostBaseNameRef::new(0, "quxx"))
                 );
                 assert_eq!(
-                    InsertWithoutNameRef::decode(&mut e),
+                    InsertWithoutNameRef::decode(&mut e, usize::MAX),
                     Ok(Some(InsertWithoutNameRef::new("foo", "bar")))
                 );
             },
@@ -504,18 +507,18 @@ mod tests {
         let mut read_encoder = Cursor::new(&mut encoder_buf);
 
         assert_eq!(
-            InsertWithNameRef::decode(&mut read_encoder),
+            InsertWithNameRef::decode(&mut read_encoder, usize::MAX),
             Ok(Some(InsertWithNameRef::new_dynamic(1, "new bar3")))
         );
         assert_eq!(
-            InsertWithNameRef::decode(&mut read_encoder),
+            InsertWithNameRef::decode(&mut read_encoder, usize::MAX),
             Ok(Some(InsertWithNameRef::new_static(
                 StaticTable::find_name(&b":method"[..]).unwrap(),
                 "staticnameref"
             )))
         );
         assert_eq!(
-            InsertWithoutNameRef::decode(&mut read_encoder),
+            InsertWithoutNameRef::decode(&mut read_encoder, usize::MAX),
             Ok(Some(InsertWithoutNameRef::new("newfoo", "newbar")))
         );
 

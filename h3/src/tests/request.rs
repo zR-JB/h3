@@ -406,10 +406,10 @@ async fn header_too_big_response_from_server_trailers() {
         assert_matches!(
             err_kind,
             StreamError::HeaderTooBig {
-                actual_size: 239,
+                actual_size,
                 max_size: 207,
                 ..
-            }
+            } if actual_size > 207
         );
         let _ = incoming_req.accept().await;
     };
@@ -680,10 +680,10 @@ async fn header_too_big_discard_from_client_trailers() {
             assert_matches!(
                 err_kind,
                 StreamError::HeaderTooBig {
-                    actual_size: 539,
+                    actual_size,
                     max_size: 200,
                     ..
-                }
+                } if actual_size > 200
             );
             request_stream.finish().await.expect("client finish");
         };
